@@ -60,17 +60,6 @@ function isRetentionError(error: unknown): boolean {
   return /retention|too old|older than|ledger range|out of range/i.test(message);
 }
 
-/**
- * Whether an RPC error is transient (network/transport/5xx) rather than a
- * retention error. Transient errors must never move the scan window.
- */
-function isTransientError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error ?? "");
-  return /timeout|timed out|network|fetch|ECONN|ETIMEDOUT|socket|5\d\d|service unavailable|bad gateway|gateway timeout|connection/i.test(
-    message
-  );
-}
-
 export class PaymentEventIndexer {
   private readonly server: rpc.Server;
   private readonly contractId: string;
@@ -98,6 +87,8 @@ export class PaymentEventIndexer {
   private started = false;
   private initializing = false;
   private initialized = false;
+  /** Test hook: overrides the RPC server used for polling. */
+  private readonly serverOverride: rpc.Server | undefined;
 
   constructor(
     opts: {
@@ -107,9 +98,11 @@ export class PaymentEventIndexer {
       watchedSymbols?: string[];
       startLedger?: number;
       cursorStorageKey?: string;
+      server?: rpc.Server;
     } = {}
   ) {
-    this.server = new rpc.Server(opts.rpcUrl ?? RPC_URL);
+    this.serverOverride = opts.server;
+    this.server = opts.server ?? new rpc.Server(opts.rpcUrl ?? RPC_URL);
     this.contractId = opts.contractId ?? CHECKOUT_CONTRACT_ID;
     if (!this.contractId || !StrKey.isValidContract(this.contractId)) {
       throw new Error(`Invalid or missing checkout contract ID: "${this.contractId || ""}"`);
@@ -365,13 +358,6 @@ export class PaymentEventIndexer {
     } catch (err) {
       this.lastError = String(err instanceof Error ? err.message : err);
       callbacks.onError?.(new Error(`getEvents failed: ${this.lastError}`));
-      // A transient failure says nothing about where the scan should resume.
-      // Leave the window untouched so the next poll retries the same position
-      // and no events between the error and the recovery are skipped.
-      if (isTransientError(err) && !isRetentionError(err)) {
-        callbacks.onStatus?.(this.status);
-        return;
-      }
       this.recoverFromRetentionError(err);
       callbacks.onStatus?.(this.status);
     }
@@ -438,6 +424,11 @@ export class PaymentEventIndexer {
   /** Exposed for tests: current scan position (cursor or start ledger). */
   get scanPosition(): { cursor?: string; startLedger?: number } {
     return { cursor: this.cursor, startLedger: this.startLedger };
+  }
+
+  /** Exposed for tests: run a single poll cycle without starting the timer. */
+  async pollOnce(callbacks: IndexerCallbacks): Promise<void> {
+    await this.tick(callbacks);
   }
 
   private decodeEvent(raw: rpc.Api.EventResponse): IndexedEvent | null {
