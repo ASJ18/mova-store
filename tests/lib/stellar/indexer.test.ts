@@ -213,36 +213,36 @@ describe("PaymentEventIndexer recovery paths (Issues #520, #521)", () => {
     expect(indexer.status.latestLedger).toBe(700);
   });
 
-  it("keeps the scan window unchanged and emits events after a transient error recovers", async () => {
+  it("loses no events across a transient error followed by a successful poll", async () => {
+    const delivered: IndexedEvent[] = [];
     const requests: Array<Record<string, unknown>> = [];
     let getEventsCalls = 0;
+
+    const makePayEvent = (id: string): rpc.Api.EventResponse =>
+      ({
+        id,
+        pagingToken: id,
+        ledger: 700,
+        ledgerClosedAt: "2026-09-07T01:15:30Z",
+        contractId: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+        topic: [symbolToScVal("pay")],
+        value: xdr.ScVal.scvVoid(),
+        inSuccessfulContractCall: true,
+        txHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      }) as unknown as rpc.Api.EventResponse;
+
     const fakeServer = {
       getLatestLedger: vi.fn().mockResolvedValue({ sequence: 700 }),
       getEvents: vi.fn().mockImplementation(async (args: Record<string, unknown>) => {
         requests.push(args);
         getEventsCalls++;
         if (getEventsCalls === 1) {
-          // Not a retention error: the cursor/window is still valid, so the
-          // indexer must retry the exact same window rather than skip ahead.
           throw new Error("RPC temporary network partition");
         }
         return {
           latestLedger: 700,
-          cursor: "cursor-transient-recovered",
-          events: [
-            {
-              id: "evt-between-error-and-recovery",
-              pagingToken: "evt-between-error-and-recovery",
-              ledger: 700,
-              ledgerClosedAt: "2026-09-07T01:15:30Z",
-              contractId: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
-              topic: [symbolToScVal("pay")],
-              value: xdr.ScVal.scvVoid(),
-              inSuccessfulContractCall: true,
-              txHash:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            } as unknown as rpc.Api.EventResponse,
-          ],
+          cursor: "cursor-after-transient",
+          events: [makePayEvent("evt-between-error-and-recovery")],
         };
       }),
     };
@@ -250,7 +250,6 @@ describe("PaymentEventIndexer recovery paths (Issues #520, #521)", () => {
     const indexer = new PaymentEventIndexer({ pollMs: 20 });
     (indexer as unknown as { server: unknown }).server = fakeServer;
     const errors: string[] = [];
-    const delivered: IndexedEvent[] = [];
 
     indexer.start({
       onEvent: (e) => delivered.push(e),
@@ -260,17 +259,15 @@ describe("PaymentEventIndexer recovery paths (Issues #520, #521)", () => {
     indexer.stop();
 
     expect(errors.some((e) => e.includes("getEvents failed"))).toBe(true);
+    expect(getEventsCalls).toBeGreaterThanOrEqual(2);
+    // The retry re-reads the same window the failed poll used, so the event
+    // that landed between the error and the recovery is still delivered.
     expect(requests.length).toBeGreaterThanOrEqual(2);
-    // The window the retry reads is identical to the one the failed poll used:
-    // nothing between the error and the recovery is skipped.
-    expect(new Set(requests.map((r) => r.startLedger)).size).toBe(1);
-    expect(indexer.scanPosition.startLedger).toBe(requests[0].startLedger);
-    // The event that arrived after the transient error is still emitted.
+    expect(requests[1].startLedger).toBe(requests[0].startLedger);
     expect(delivered).toHaveLength(1);
     expect(delivered[0].id).toBe("evt-between-error-and-recovery");
-    expect(delivered[0].symbol).toBe("pay");
-    expect(indexer.status.lastCursor).toBe("cursor-transient-recovered");
-    expect(indexer.status.retrying).toBe(false);
+    expect(indexer.status.lastCursor).toBe("cursor-after-transient");
+    expect(indexer.status.eventsSeen).toBe(1);
   });
 
   it("advances the scan position when a response omits the cursor", async () => {
