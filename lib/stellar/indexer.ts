@@ -30,6 +30,8 @@ export interface IndexedEvent {
   topics: xdr.ScVal[];
   /** Decoded fields: topics[1..] as topic1..topicN plus data-map entries. */
   fields: Record<string, string>;
+  /** True when the event was recovered after a transient error. */
+  recovered?: boolean;
 }
 
 export interface IndexerStatus {
@@ -87,8 +89,8 @@ export class PaymentEventIndexer {
   private started = false;
   private initializing = false;
   private initialized = false;
-
-  private readonly onEventDelivered: ((event: IndexedEvent) => void) | undefined;
+  /** Set when a transient error occurred; cleared once a poll succeeds. */
+  private transientError = false;
 
   constructor(
     opts: {
@@ -98,7 +100,6 @@ export class PaymentEventIndexer {
       watchedSymbols?: string[];
       startLedger?: number;
       cursorStorageKey?: string;
-      onEventDelivered?: (event: IndexedEvent) => void;
     } = {}
   ) {
     this.server = new rpc.Server(opts.rpcUrl ?? RPC_URL);
@@ -111,7 +112,6 @@ export class PaymentEventIndexer {
     this.durableStartLedger =
       opts.startLedger !== undefined && opts.startLedger > 0 ? opts.startLedger : undefined;
     this.cursorStorageKey = opts.cursorStorageKey;
-    this.onEventDelivered = opts.onEventDelivered;
   }
 
   get status(): IndexerStatus {
@@ -325,6 +325,7 @@ export class PaymentEventIndexer {
       const res = await this.fetchEvents();
       this.latestLedger = res.latestLedger;
       this.lastError = undefined;
+      this.transientError = false;
 
       // Once a cursor is available, drop the start-ledger window so the next
       // poll advances by cursor instead of re-scanning the backfill range. This
@@ -347,7 +348,6 @@ export class PaymentEventIndexer {
         if (decoded) {
           this.eventsSeen += 1;
           try {
-            this.onEventDelivered?.(decoded);
             callbacks.onEvent(decoded);
           } catch {
             // a throwing consumer must not break the poll loop
@@ -358,6 +358,7 @@ export class PaymentEventIndexer {
       callbacks.onStatus?.(this.status);
     } catch (err) {
       this.lastError = String(err instanceof Error ? err.message : err);
+      this.transientError = !isRetentionError(err);
       callbacks.onError?.(new Error(`getEvents failed: ${this.lastError}`));
       this.recoverFromRetentionError(err);
       callbacks.onStatus?.(this.status);
@@ -425,6 +426,11 @@ export class PaymentEventIndexer {
   /** Exposed for tests: current scan position (cursor or start ledger). */
   get scanPosition(): { cursor?: string; startLedger?: number } {
     return { cursor: this.cursor, startLedger: this.startLedger };
+  }
+
+  /** Exposed for tests: whether the last poll failed with a transient error. */
+  get hasTransientError(): boolean {
+    return this.transientError;
   }
 
   private decodeEvent(raw: rpc.Api.EventResponse): IndexedEvent | null {
