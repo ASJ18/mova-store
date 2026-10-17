@@ -8,14 +8,14 @@ import {
 } from "./config";
 import { scValToString } from "./scval";
 
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 // Real-time event indexer.
 //
 // Polls `getEvents` (cursor-paginated) for the checkout contract and decodes
 // the contract's events (`pay`, `create_order`, `dispatch`, `refund`) so the
 // UI can update instantly when a payment lands. Uses a ledger backfill on
 // first connect, then advances by cursor so nothing is missed between polls.
-// ---------------------------------------------------------------------------
+// ----------------------------------------------------------------------------
 
 export interface IndexedEvent {
   id: string;
@@ -30,8 +30,6 @@ export interface IndexedEvent {
   topics: xdr.ScVal[];
   /** Decoded fields: topics[1..] as topic1..topicN plus data-map entries. */
   fields: Record<string, string>;
-  /** True when the event was recovered after a transient error. */
-  recovered?: boolean;
 }
 
 export interface IndexerStatus {
@@ -89,8 +87,6 @@ export class PaymentEventIndexer {
   private started = false;
   private initializing = false;
   private initialized = false;
-  /** Set when a transient error occurred; cleared once a poll succeeds. */
-  private transientError = false;
 
   constructor(
     opts: {
@@ -134,7 +130,7 @@ export class PaymentEventIndexer {
 
     this.attachVisibilityListener(callbacks);
 
-    // A tab that is already hidden must not schedule polls at all; the
+    // A tab hat is already hidden must not schedule polls at all; the
     // visibilitychange handler resumes (with a catch-up tick) on focus.
     if (typeof document !== "undefined" && document.hidden) {
       this.paused = true;
@@ -325,7 +321,6 @@ export class PaymentEventIndexer {
       const res = await this.fetchEvents();
       this.latestLedger = res.latestLedger;
       this.lastError = undefined;
-      this.transientError = false;
 
       // Once a cursor is available, drop the start-ledger window so the next
       // poll advances by cursor instead of re-scanning the backfill range. This
@@ -357,104 +352,88 @@ export class PaymentEventIndexer {
 
       callbacks.onStatus?.(this.status);
     } catch (err) {
-      this.lastError = String(err instanceof Error ? err.message : err);
-      this.transientError = !isRetentionError(err);
-      callbacks.onError?.(new Error(`getEvents failed: ${this.lastError}`));
-      this.recoverFromRetentionError(err);
+      const message = err instanceof Error ? err.message : String(err);
+      this.lastError = message;
+
+      // Only a genuine retention error means the cursor/start-ledger position
+      // is now unreachable. For a transient failure the window must be left
+      // untouched so the next poll rescues the same range and no event is lost.
+      if (isRetentionError(err)) {
+        this.recoverFromRetentionError();
+      }
+
+      callbacks.onError?.(new Error(`Stellar event poll failed (retrying): ${message}`));
       callbacks.onStatus?.(this.status);
     }
   }
 
-  private async fetchEvents(): Promise<rpc.Api.GetEventsResponse> {
-    const filters: rpc.Api.EventFilter[] = [
-      {
-        type: "contract",
-        contractIds: [this.contractId],
-        topics: this.topicFilters(),
-      },
-    ];
-    if (this.startLedger !== undefined) {
-      return this.server.getEvents({ filters, startLedger: this.startLedger });
-    }
+  /**
+   * Recover from a retention error by restarting the scan just before the
+   * retained window. Only called for genuine retention errors; a transient
+   * failure leaves the window alone so no events are skipped.
+   */
+  private recoverFromRetentionError(): void {
+    const from = this.latestLedger ?? this.startLedger ?? 1;
+    this.cursor = undefined;
+    this.startLedger = Math.max(1, from - RETENTION_RETRY_LEDGER_DELTA);
+    this.clearPersistedCursor();
+  }
+
+  private async fetchEvents(): Promise<{
+    events: rpc.Api.GetEventsResponse["events"];
+    cursor: string | undefined;
+    latestLedger: number;
+  }> {
+    const request: rpc.Server.GetEventsRequest = {
+      filters: [
+        {
+          type: "contract",
+          contractIds: [this.contractId],
+        },
+      ],
+      limit: 100,
+    };
+
     if (this.cursor) {
-      return this.server.getEvents({ filters, cursor: this.cursor });
-    }
-    throw new Error("Indexer has no cursor or start ledger to poll from.");
-  }
-
-  /**
-   * One topic filter per watched symbol, matching `topics[0]` (the event name)
-   * at the RPC so unwatched events are never transferred or decoded. The RPC
-   * ORs the per-symbol filters and each segment is a base64-encoded `ScVal`.
-   */
-  private topicFilters(): string[][] {
-    return this.watchedSymbols.map((symbol) => [xdr.ScVal.scvSymbol(symbol).toXDR("base64")]);
-  }
-
-  /**
-   * Keep the scan recoverable. A start ledger that predates the RPC's
-   * retention window is rolled forward toward the tip. A persisted cursor can
-   * outlive retention for the same reason, so on a retention error it is
-   * dropped and the window is re-derived — a view must not get permanently
-   * stuck on a stale resume point.
-   */
-  private recoverFromRetentionError(error?: unknown): void {
-    // A transient failure - a timeout, a 5xx, a dropped connection - says
-    // nothing about where the scan should resume. Moving the window on any
-    // error skips every event between the old and the new position, so only a
-    // retention error, where the requested position has genuinely aged out of
-    // the RPC's history, may move it. Everything else retries the same window.
-    if (!isRetentionError(error)) return;
-
-    if (this.startLedger !== undefined && this.latestLedger !== undefined) {
-      this.startLedger = Math.max(
-        this.startLedger,
-        this.latestLedger - RETENTION_RETRY_LEDGER_DELTA
-      );
-      return;
+      request.cursor = this.cursor;
+    } else if (this.startLedger !== undefined) {
+      request.startLedger = this.startLedger;
+    } else {
+      throw new Error("no cursor or start ledger to poll from");
     }
 
-    // The retention check above already ran, so reaching this point means the
-    // cursor really has outlived the RPC's history.
-    if (this.cursor !== undefined) {
-      this.cursor = undefined;
-      this.clearPersistedCursor();
-      this.startLedger = this.resolveStartLedger();
-    }
+    const res = await this.server.getEvents(request);
+    return {
+      events: res.events,
+      cursor: res.cursor,
+      latestLedger: res.latestLedger,
+    };
   }
 
-  /** Exposed for tests: current scan position (cursor or start ledger). */
-  get scanPosition(): { cursor?: string; startLedger?: number } {
-    return { cursor: this.cursor, startLedger: this.startLedger };
-  }
+  private decodeEvent(raw: rpc.Api.EventResponse): IndexedEvent | undefined {
+    const topics = raw.topic;
+    if (!topics || topics.length === 0) return undefined;
 
-  /** Exposed for tests: whether the last poll failed with a transient error. */
-  get hasTransientError(): boolean {
-    return this.transientError;
-  }
-
-  private decodeEvent(raw: rpc.Api.EventResponse): IndexedEvent | null {
-    const first = raw.topic[0];
-    if (!first || first.type !== "scvSymbol") return null;
-    const symbol = first.sym.toString();
-    if (!this.watchedSymbols.includes(symbol)) return null;
+    const symbol = scValToString(topics[0]);
+    if (!symbol || !this.watchedSymbols.includes(symbol)) return undefined;
 
     const fields: Record<string, string> = {};
-    raw.topic.slice(1).forEach((topic, index) => {
-      fields[`topic${index + 1}`] = scValToString(topic);
-    });
+    for (let i = 1; i < topics.length; i++) {
+      const value = scValToString(topics[i]);
+      if (value !== undefined) {
+        fields[`topic${i}`] = value;
+      }
+    }
 
     const data = raw.value;
-    if (data.type === "scvMap") {
-      for (const entry of data.map ?? []) {
-        const key =
-          entry.key.type === "scvSymbol" ? entry.key.sym.toString() : scValToString(entry.key);
-        fields[key] = scValToString(entry.val);
+    if (data && data.switch().name === "scvMap") {
+      for (const entry of data.map()) {
+        const key = scValToString(entry.key());
+        const value = scValToString(entry.val());
+        if (key !== undefined && value !== undefined) {
+          fields[key] = value;
+        }
       }
-    } else if (data.type === "scvVec") {
-      fields.value = (data.vec ?? []).map(scValToString).join(",");
-    } else {
-      fields.value = scValToString(data);
     }
 
     return {
@@ -462,9 +441,9 @@ export class PaymentEventIndexer {
       ledger: raw.ledger,
       ledgerClosedAt: raw.ledgerClosedAt,
       txHash: raw.txHash,
-      contractId: raw.contractId?.toString(),
+      contractId: raw.contractId,
       symbol,
-      topics: raw.topic,
+      topics,
       fields,
     };
   }
