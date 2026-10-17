@@ -213,58 +213,6 @@ describe("PaymentEventIndexer recovery paths (Issues #520, #521)", () => {
     expect(indexer.status.latestLedger).toBe(700);
   });
 
-  it("loses no events across a transient error followed by a successful poll", async () => {
-    const delivered: IndexedEvent[] = [];
-    let getEventsCalls = 0;
-    const fakeServer = {
-      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 700 }),
-      getEvents: vi.fn().mockImplementation(async () => {
-        getEventsCalls++;
-        if (getEventsCalls === 1) {
-          throw new Error("RPC temporary network partition");
-        }
-        return {
-          latestLedger: 700,
-          cursor: "cursor-after-transient",
-          events: [
-            {
-              id: "evt-between-error-and-recovery",
-              pagingToken: "evt-between-error-and-recovery",
-              ledger: 700,
-              ledgerClosedAt: "2026-09-07T01:15:30Z",
-              contractId: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
-              topic: [symbolToScVal("pay")],
-              value: xdr.ScVal.scvVoid(),
-              inSuccessfulContractCall: true,
-              txHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            } as unknown as rpc.Api.EventResponse,
-          ],
-        };
-      }),
-    };
-
-    const indexer = new PaymentEventIndexer({ pollMs: 20 });
-    (indexer as unknown as { server: unknown }).server = fakeServer;
-    const errors: string[] = [];
-
-    indexer.start({
-      onEvent: (e) => delivered.push(e),
-      onError: (err) => errors.push(err.message),
-    });
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    indexer.stop();
-
-    // The transient error was surfaced but did not abort the scan.
-    expect(errors.some((e) => e.includes("getEvents failed"))).toBe(true);
-    expect(getEventsCalls).toBeGreaterThanOrEqual(2);
-    // The event that landed between the error and the recovery is delivered,
-    // proving the data-loss path is closed.
-    expect(delivered.map((e) => e.id)).toContain("evt-between-error-and-recovery");
-    expect(indexer.status.lastCursor).toBe("cursor-after-transient");
-    expect(indexer.status.latestLedger).toBe(700);
-    expect(indexer.status.retrying).toBe(false);
-  });
-
   it("advances the scan position when a response omits the cursor", async () => {
     let getEventsCalls = 0;
     const fakeServer = {
@@ -397,6 +345,65 @@ describe("PaymentEventIndexer transient-error window guard (Issue #520)", () => 
     // A timeout is not evidence that the cursor expired, so it must survive.
     expect(indexer.scanPosition.cursor).toBe("cursor-kept");
     expect(window.localStorage.getItem(STORAGE_KEY)).toBe("cursor-kept");
+  });
+
+  it("keeps the scan window and delivers events across a transient error", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const delivered: IndexedEvent[] = [];
+    let getEventsCalls = 0;
+
+    const payEvent = (id: string): rpc.Api.EventResponse =>
+      ({
+        id,
+        pagingToken: id,
+        ledger: 900,
+        ledgerClosedAt: "2026-09-07T01:15:30Z",
+        contractId: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+        topic: [symbolToScVal("pay")],
+        value: xdr.ScVal.scvVoid(),
+        inSuccessfulContractCall: true,
+        txHash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      }) as unknown as rpc.Api.EventResponse;
+
+    const server = {
+      getLatestLedger: vi.fn().mockResolvedValue({ sequence: 900 }),
+      getEvents: vi.fn().mockImplementation(async (args: Record<string, unknown>) => {
+        requests.push(args);
+        getEventsCalls++;
+        if (getEventsCalls === 1) {
+          // Not a retention error: the window must not move.
+          throw new Error("RPC temporary network partition");
+        }
+        return {
+          latestLedger: 900,
+          cursor: "cursor-after-transient",
+          events: [payEvent("evt-after-transient")],
+        };
+      }),
+    };
+
+    const indexer = new PaymentEventIndexer({ pollMs: 20 });
+    (indexer as unknown as { server: unknown }).server = server;
+    const errors: string[] = [];
+
+    indexer.start({
+      onEvent: (e) => delivered.push(e),
+      onError: (err) => errors.push(err.message),
+    });
+    await tick(80);
+    indexer.stop();
+
+    expect(errors.some((e) => e.includes("getEvents failed"))).toBe(true);
+    expect(getEventsCalls).toBeGreaterThanOrEqual(2);
+    // The recovery poll re-reads the same window the failed poll used, so no
+    // event between the error and the recovery can be skipped.
+    expect(requests.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(requests.map((r) => r.startLedger)).size).toBe(1);
+    expect(indexer.scanPosition.startLedger).toBe(requests[0].startLedger);
+    // The event that landed after the transient error is still delivered.
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].id).toBe("evt-after-transient");
+    expect(indexer.status.lastCursor).toBe("cursor-after-transient");
   });
 });
 

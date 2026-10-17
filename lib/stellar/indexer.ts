@@ -61,14 +61,12 @@ function isRetentionError(error: unknown): boolean {
 }
 
 /**
- * Whether an RPC error is a transient transport failure (timeout, 5xx,
- * dropped connection) that says nothing about where the scan should resume.
+ * Whether an RPC error is transient (network/transport/5xx) as opposed to a
+ * retention error. Transient failures must not move the scan window.
  */
 function isTransientError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
-  return /timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket hang up|network|fetch failed|5\d\d|service unavailable|bad gateway|gateway timeout|internal server error/i.test(
-    message
-  );
+  return /timeout|timed out|network|fetch failed|ECONN|ETIMEDOUT|ENOTFOUND|5\d\d|service unavailable|bad gateway|gateway timeout/i.test(message);
 }
 
 export class PaymentEventIndexer {
@@ -410,11 +408,8 @@ export class PaymentEventIndexer {
     // retention error, where the requested position has genuinely aged out of
     // the RPC's history, may move it. Everything else retries the same window.
     if (!isRetentionError(error)) return;
-
-    // A transient failure is explicitly not retention-related even if its
-    // message happens to match a retention keyword (e.g. a proxy error page
-    // mentioning "range"). Never move the window for a transient error: the
-    // next poll must retry the same position so no event is skipped.
+    // Belt-and-braces: a transient failure must never be treated as retention
+    // even if its message happens to match the retention pattern.
     if (isTransientError(error)) return;
 
     if (this.startLedger !== undefined && this.latestLedger !== undefined) {
@@ -434,9 +429,19 @@ export class PaymentEventIndexer {
     }
   }
 
+  /** Exposed for tests: whether an error would be classified as transient. */
+  static isTransientError(error: unknown): boolean {
+    return isTransientError(error);
+  }
+
   /** Exposed for tests: current scan position (cursor or start ledger). */
   get scanPosition(): { cursor?: string; startLedger?: number } {
     return { cursor: this.cursor, startLedger: this.startLedger };
+  }
+
+  /** Exposed for tests: whether an error would be classified as retention. */
+  static isRetentionError(error: unknown): boolean {
+    return isRetentionError(error);
   }
 
   private decodeEvent(raw: rpc.Api.EventResponse): IndexedEvent | null {
