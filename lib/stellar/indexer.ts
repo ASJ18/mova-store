@@ -32,8 +32,6 @@ export interface IndexedEvent {
   fields: Record<string, string>;
 }
 
-export { isRetentionError };
-
 export interface IndexerStatus {
   running: boolean;
   /** True while the indexer is started but polling is suspended (tab hidden). */
@@ -57,7 +55,7 @@ const RETENTION_RETRY_LEDGER_DELTA = 5;
  * Whether an RPC error means the requested position fell outside the retained
  * event window (as opposed to a transient network/transport failure).
  */
-function isRetentionError(error: unknown): boolean {
+export function isRetentionError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
   return /retention|too old|older than|ledger range|out of range/i.test(message);
 }
