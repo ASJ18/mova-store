@@ -213,11 +213,12 @@ describe("PaymentEventIndexer recovery paths (Issues #520, #521)", () => {
     expect(indexer.status.latestLedger).toBe(700);
   });
 
-  it("loses no events across a transient error followed by a successful poll", async () => {
+  it("does not skip events emitted between a transient error and the recovery poll", async () => {
+    const CONTRACT_ID = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
     const delivered: IndexedEvent[] = [];
     const requests: Array<Record<string, unknown>> = [];
-    const CONTRACT_ID = "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA";
-    const eventInWindow = (id: string): rpc.Api.EventResponse =>
+
+    const makePayEvent = (id: string): rpc.Api.EventResponse =>
       ({
         id,
         pagingToken: id,
@@ -237,12 +238,15 @@ describe("PaymentEventIndexer recovery paths (Issues #520, #521)", () => {
         requests.push(args);
         getEventsCalls++;
         if (getEventsCalls === 1) {
+          // Transient: says nothing about where the scan should resume.
           throw new Error("RPC temporary network partition");
         }
+        // The recovery poll must re-read the same window and surface the
+        // events that landed while the indexer was failing.
         return {
           latestLedger: 700,
           cursor: "cursor-after-transient",
-          events: [eventInWindow("evt-between-error-and-recovery")],
+          events: [makePayEvent("evt-during-outage")],
         };
       }),
     };
@@ -260,13 +264,18 @@ describe("PaymentEventIndexer recovery paths (Issues #520, #521)", () => {
 
     expect(errors.some((e) => e.includes("getEvents failed"))).toBe(true);
     expect(getEventsCalls).toBeGreaterThanOrEqual(2);
-    // The window the recovery poll reads is the same one the failed poll used.
+
+    // The window did not move: the recovery poll re-read the same startLedger.
     expect(requests.length).toBeGreaterThanOrEqual(2);
     expect(new Set(requests.map((r) => r.startLedger)).size).toBe(1);
     expect(indexer.scanPosition.startLedger).toBe(requests[0].startLedger);
-    // The event that landed between the error and the recovery is delivered.
-    expect(delivered.map((e) => e.id)).toContain("evt-between-error-and-recovery");
+
+    // No events were lost across the error/recovery boundary.
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0].id).toBe("evt-during-outage");
+    expect(indexer.status.eventsSeen).toBe(1);
     expect(indexer.status.lastCursor).toBe("cursor-after-transient");
+    expect(indexer.status.latestLedger).toBe(700);
   });
 
   it("advances the scan position when a response omits the cursor", async () => {

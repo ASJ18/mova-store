@@ -55,7 +55,7 @@ const RETENTION_RETRY_LEDGER_DELTA = 5;
  * Whether an RPC error means the requested position fell outside the retained
  * event window (as opposed to a transient network/transport failure).
  */
-export function isRetentionError(error: unknown): boolean {
+function isRetentionError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? "");
   return /retention|too old|older than|ledger range|out of range/i.test(message);
 }
@@ -88,6 +88,8 @@ export class PaymentEventIndexer {
   private initializing = false;
   private initialized = false;
 
+  private readonly onEventDelivered: ((event: IndexedEvent) => void) | undefined;
+
   constructor(
     opts: {
       rpcUrl?: string;
@@ -96,6 +98,7 @@ export class PaymentEventIndexer {
       watchedSymbols?: string[];
       startLedger?: number;
       cursorStorageKey?: string;
+      onEventDelivered?: (event: IndexedEvent) => void;
     } = {}
   ) {
     this.server = new rpc.Server(opts.rpcUrl ?? RPC_URL);
@@ -108,6 +111,7 @@ export class PaymentEventIndexer {
     this.durableStartLedger =
       opts.startLedger !== undefined && opts.startLedger > 0 ? opts.startLedger : undefined;
     this.cursorStorageKey = opts.cursorStorageKey;
+    this.onEventDelivered = opts.onEventDelivered;
   }
 
   get status(): IndexerStatus {
@@ -343,6 +347,7 @@ export class PaymentEventIndexer {
         if (decoded) {
           this.eventsSeen += 1;
           try {
+            this.onEventDelivered?.(decoded);
             callbacks.onEvent(decoded);
           } catch {
             // a throwing consumer must not break the poll loop
