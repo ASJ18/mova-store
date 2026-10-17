@@ -60,6 +60,17 @@ function isRetentionError(error: unknown): boolean {
   return /retention|too old|older than|ledger range|out of range/i.test(message);
 }
 
+/**
+ * Whether an RPC error is a transient transport failure (timeout, 5xx,
+ * dropped connection) that says nothing about where the scan should resume.
+ */
+function isTransientError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return /timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket hang up|network|fetch failed|5\d\d|service unavailable|bad gateway|gateway timeout|internal server error/i.test(
+    message
+  );
+}
+
 export class PaymentEventIndexer {
   private readonly server: rpc.Server;
   private readonly contractId: string;
@@ -87,8 +98,6 @@ export class PaymentEventIndexer {
   private started = false;
   private initializing = false;
   private initialized = false;
-  /** Test hook: overrides the RPC server used for polling. */
-  private readonly serverOverride: rpc.Server | undefined;
 
   constructor(
     opts: {
@@ -98,11 +107,9 @@ export class PaymentEventIndexer {
       watchedSymbols?: string[];
       startLedger?: number;
       cursorStorageKey?: string;
-      server?: rpc.Server;
     } = {}
   ) {
-    this.serverOverride = opts.server;
-    this.server = opts.server ?? new rpc.Server(opts.rpcUrl ?? RPC_URL);
+    this.server = new rpc.Server(opts.rpcUrl ?? RPC_URL);
     this.contractId = opts.contractId ?? CHECKOUT_CONTRACT_ID;
     if (!this.contractId || !StrKey.isValidContract(this.contractId)) {
       throw new Error(`Invalid or missing checkout contract ID: "${this.contractId || ""}"`);
@@ -404,6 +411,12 @@ export class PaymentEventIndexer {
     // the RPC's history, may move it. Everything else retries the same window.
     if (!isRetentionError(error)) return;
 
+    // A transient failure is explicitly not retention-related even if its
+    // message happens to match a retention keyword (e.g. a proxy error page
+    // mentioning "range"). Never move the window for a transient error: the
+    // next poll must retry the same position so no event is skipped.
+    if (isTransientError(error)) return;
+
     if (this.startLedger !== undefined && this.latestLedger !== undefined) {
       this.startLedger = Math.max(
         this.startLedger,
@@ -424,11 +437,6 @@ export class PaymentEventIndexer {
   /** Exposed for tests: current scan position (cursor or start ledger). */
   get scanPosition(): { cursor?: string; startLedger?: number } {
     return { cursor: this.cursor, startLedger: this.startLedger };
-  }
-
-  /** Exposed for tests: run a single poll cycle without starting the timer. */
-  async pollOnce(callbacks: IndexerCallbacks): Promise<void> {
-    await this.tick(callbacks);
   }
 
   private decodeEvent(raw: rpc.Api.EventResponse): IndexedEvent | null {
